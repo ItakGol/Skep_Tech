@@ -7,11 +7,10 @@ from httpx._utils import URLPattern
 
 def url_to_origin(url: str):
     """
-    Given a URL string, return the origin in the raw tuple format that
-    `httpcore` uses for it's representation.
+    Given a URL string, return the origin as an httpcore.URL() instance.
     """
-    scheme, host, port = httpx.URL(url).raw[:3]
-    return httpcore.URL(scheme=scheme, host=host, port=port, target="/")
+    u = httpx.URL(url)
+    return httpcore.URL(scheme=u.raw_scheme, host=u.raw_host, port=u.port, target=b"/")
 
 
 @pytest.mark.parametrize(

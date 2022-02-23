@@ -1,13 +1,220 @@
+import ipaddress
+import re
 import typing
-from urllib.parse import parse_qs, quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin
 
 import idna
-import rfc3986
-import rfc3986.exceptions
 
 from ._exceptions import InvalidURL
-from ._types import PrimitiveData, QueryParamTypes, RawURL, URLTypes
+from ._types import PrimitiveData, QueryParamTypes, URLTypes
 from ._utils import primitive_value_to_str
+
+NOT_PERCENT_ENCODED = b"!#$&'()*+,-./0123456789:;=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_abcdefghijklmnopqrstuvwxyz~"
+PERCENT_ENCODED_REGEX = re.compile(b"%[A-Fa-f0-9]{2}")
+
+
+# {scheme}:      (optional)
+# //{authority}  (optional)
+# {path}
+# ?{query}       (optional)
+# #{fragment}    (optional)
+URL_REGEX = re.compile(
+    (
+        r"(?:(?P<scheme>{scheme}):)?"
+        r"(?://(?P<authority>{authority}))?"
+        r"(?P<path>{path})"
+        r"(?:\?(?P<query>{query}))?"
+        r"(?:#(?P<fragment>{fragment}))?"
+    ).format(
+        scheme="[a-zA-Z][a-zA-Z0-9+.-]*",
+        authority="[^\\\\/?#]*",
+        path="[^?#]*",
+        query="[^#]*",
+        fragment=".*",
+    )
+)
+
+# {userinfo}@    (optional)
+# {host}
+# :{port}        (optional)
+AUTHORITY_REGEX = re.compile(
+    (
+        r"(?:(?P<userinfo>{userinfo})@)?" r"(?P<host>{host})" r":?(?P<port>{port})?"
+    ).format(userinfo="[^@]*", host="(\\[.*\\]|[^:]*)", port=".*")
+)
+
+# We use these simple regexs as a first pass before handing off to
+# the stdlib 'ipaddress' module for IP address validation.
+IPv4_STYLE_HOSTNAME = re.compile(r"^[0-9]+.[0-9]+.[0-9]+.[0-9]+$")
+IPv6_STYLE_HOSTNAME = re.compile(r"^\[.*\]$")
+
+
+class _ParseResult(typing.NamedTuple):
+    scheme: bytes
+    userinfo: bytes
+    host: bytes
+    port: int
+    path: bytes
+    query: typing.Optional[bytes]
+    fragment: typing.Optional[bytes]
+
+
+def parse(url: str, **kwargs: typing.Optional[str]) -> _ParseResult:
+    url = url.replace("\n", "").replace("\r", "").replace("\t", "")
+
+    url_match = URL_REGEX.match(url).groupdict()
+    scheme = kwargs.get("scheme", url_match["scheme"]) or ""
+    authority = kwargs.get("authority", url_match["authority"]) or ""
+    path = kwargs.get("path", url_match["path"]) or ""
+    query = kwargs.get("query", url_match["query"])
+    fragment = kwargs.get("fragment", url_match["fragment"])
+
+    authority_match = AUTHORITY_REGEX.match(authority).groupdict()
+    userinfo = kwargs.get("userinfo", authority_match["userinfo"]) or ""
+    host = kwargs.get("host", authority_match["host"]) or ""
+    port = kwargs.get("port", authority_match["port"])
+
+    # Normalize and validate each component.
+    # We end up with a parsed representation of the URL,
+    # with components that are plain ASCII bytestrings.
+    parsed_scheme: bytes = encode_scheme(scheme)
+    parsed_userinfo: bytes = encode_userinfo(userinfo)
+    parsed_host: bytes = encode_host(host)
+    parsed_port: int = normalize_port(port, scheme)
+    if scheme and authority:
+        path = normalize_path(path)
+    parsed_path: bytes = encode_path(path)
+    parsed_query: typing.Optional[bytes] = encode_query(query)
+    parsed_fragment: typing.Optional[bytes] = encode_fragment(fragment)
+
+    # The parsed ASCII bytestrings are our canonical form.
+    # All properties of the URL are derived from these.
+    return _ParseResult(
+        parsed_scheme,
+        parsed_userinfo,
+        parsed_host,
+        parsed_port,
+        parsed_path,
+        parsed_query,
+        parsed_fragment,
+    )
+
+
+def encode_scheme(scheme: str) -> bytes:
+    return scheme.encode("ascii").lower()
+
+
+def encode_userinfo(userinfo: str) -> bytes:
+    encoded_userinfo = userinfo.encode("utf-8")
+    return quote_if_needed(encoded_userinfo)
+
+
+def encode_host(host: str) -> bytes:
+    if not host:
+        return b""
+
+    elif IPv4_STYLE_HOSTNAME.match(host):
+        # Validate hostnames like #.#.#.#
+        try:
+            ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            raise InvalidURL("Invalid IPv4 address")
+        return host.encode("ascii")
+
+    elif IPv6_STYLE_HOSTNAME.match(host):
+        # Validate hostnames like [...]
+        # (IPv6 hostnames must always be enclosed within sqaurte brackets)
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ipaddress.AddressValueError:
+            raise InvalidURL("Invalid IPv6 address")
+        return host[1:-1].encode("ascii")
+
+    elif all(ord(char) <= 127 for char in host):
+        # Regular ASCII hostnames
+        encoded_host = host.encode("ascii").lower()
+        return quote_if_needed(encoded_host)
+
+    # IDNA hostnames
+    try:
+        return idna.encode(host.lower())
+    except idna.IDNAError:
+        raise InvalidURL("Invalid IDNA hostname")
+
+
+def encode_path(path: str) -> bytes:
+    encoded_path = path.encode("utf-8")
+    return quote_if_needed(encoded_path)
+
+
+def encode_query(query: typing.Optional[str]) -> typing.Optional[bytes]:
+    if query is None:
+        return None
+
+    encoded_query = query.encode("utf-8")
+    return quote_if_needed(encoded_query)
+
+
+def encode_fragment(fragment: typing.Optional[str]) -> typing.Optional[bytes]:
+    if fragment is None:
+        return None
+
+    encoded_fragment = fragment.encode("utf-8")
+    return quote_if_needed(encoded_fragment)
+
+
+def normalize_port(
+    port: typing.Optional[typing.Union[str, int]], scheme: str
+) -> typing.Optional[int]:
+    # https://tools.ietf.org/html/rfc3986#section-3.2.3
+    #
+    # A scheme may define a default port.  For example, the "http" scheme
+    # defines a default port of "80", corresponding to its reserved TCP
+    # port number.  The type of port designated by the port number (e.g.,
+    # TCP, UDP, SCTP) is defined by the URI scheme.  URI producers and
+    # normalizers should omit the port component and its ":" delimiter if
+    # port is empty or if its value would be the same as that of the
+    # scheme's default.
+    if not port:
+        return None
+
+    # validate
+    port_as_int = int(port)
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    if port_as_int == default_port:
+        return None
+    return port_as_int
+
+
+def normalize_path(path: str) -> str:
+    # https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4
+    components = path.split("/")
+    output = []
+    for component in components:
+        if component == ".":
+            pass
+        elif component == "..":
+            if output:
+                output.pop()
+        else:
+            output.append(component)
+    return "/".join(output)
+
+
+def quote_if_needed(component: bytes) -> bytes:
+    ESCAPED_CHARS = NOT_PERCENT_ENCODED
+    if component.count(b"%") == len(PERCENT_ENCODED_REGEX.findall(component)):
+        # If the component is already percent encoded,
+        # then include percent as a non-escaping byte.
+        ESCAPED_CHARS += b"%"
+
+    byte_list = [component[idx : idx + 1] for idx in range(len(component))]
+    return b"".join(
+        [
+            byte if byte in ESCAPED_CHARS else f"%{ord(byte):02x}".encode().upper()
+            for byte in byte_list
+        ]
+    )
 
 
 class URL:
@@ -71,58 +278,73 @@ class URL:
     """
 
     def __init__(
-        self, url: typing.Union["URL", str, RawURL] = "", **kwargs: typing.Any
+        self, url: typing.Union["URL", str] = "", **kwargs: typing.Any
     ) -> None:
-        if isinstance(url, (str, tuple)):
-            if isinstance(url, tuple):
-                raw_scheme, raw_host, port, raw_path = url
-                scheme = raw_scheme.decode("ascii")
-                host = raw_host.decode("ascii")
-                if host and ":" in host and host[0] != "[":
-                    # it's an IPv6 address, so it should be enclosed in "[" and "]"
-                    # ref: https://tools.ietf.org/html/rfc2732#section-2
-                    # ref: https://tools.ietf.org/html/rfc3986#section-3.2.2
-                    host = f"[{host}]"
-                port_str = "" if port is None else f":{port}"
-                path = raw_path.decode("ascii")
-                url = f"{scheme}://{host}{port_str}{path}"
+        if isinstance(url, str):
+            if kwargs:
+                allowed = {
+                    "scheme": str,
+                    "username": str,
+                    "password": str,
+                    "userinfo": bytes,
+                    "host": str,
+                    "port": int,
+                    "path": str,
+                    "query": bytes,
+                    "fragment": str,
+                    "params": object,
+                }
 
-            try:
-                self._uri_reference = rfc3986.iri_reference(url).encode()
-            except rfc3986.exceptions.InvalidAuthority as exc:
-                raise InvalidURL(message=str(exc)) from None
+                # Perform type checking for all supported keyword arguments.
+                for key, value in kwargs.items():
+                    if key not in allowed:
+                        message = f"{key!r} is an invalid keyword argument."
+                        raise TypeError(message)
+                    if value is not None and not isinstance(value, allowed[key]):
+                        expected = allowed[key].__name__
+                        seen = type(value).__name__
+                        message = f"Argument {key!r} must be {expected} but got {seen}."
+                        raise TypeError(message)
 
-            if self.is_absolute_url:
-                # We don't want to normalize relative URLs, since doing so
-                # removes any leading `../` portion.
-                self._uri_reference = self._uri_reference.normalize()
+                # The 'query' argument should be provided as bytes to match `url.query`,
+                # but internally we want it as a string here.
+                if "query" in kwargs and kwargs["query"] is not None:
+                    kwargs["query"] = kwargs["query"].decode("ascii")
+
+                # The 'userinfo' argument should be provided as bytes to match `url.userinfo`,
+                # but internally we want it as a string here.
+                if "userinfo" in kwargs and kwargs["userinfo"] is not None:
+                    kwargs["userinfo"] = kwargs["userinfo"].decode("ascii")
+
+                # IPv6 hosts need to be enclosed within square brackets.
+                if (
+                    kwargs.get("host")
+                    and ":" in kwargs["host"]
+                    and not kwargs["host"].startswith("[")
+                ):
+                    kwargs["host"] = "[" + kwargs["host"] + "]"
+
+                # The 'username' and 'password' keyword arguments need to be coerced
+                # into a single 'userinfo'.
+                if "username" in kwargs or "password" in kwargs:
+                    username = quote(kwargs.pop("username", "") or "")
+                    password = quote(kwargs.pop("password", "") or "")
+                    kwargs["userinfo"] = (
+                        f"{username}:{password}" if password else username
+                    )
+
+                # The 'params' keyword argument needs to be coerced to 'query'.
+                if "params" in kwargs:
+                    params = kwargs.pop("params")
+                    kwargs["query"] = None if not params else str(QueryParams(params))
+
+            self._parsed = parse(url, **kwargs)
         elif isinstance(url, URL):
-            self._uri_reference = url._uri_reference
+            self._parsed = url._parsed
         else:
             raise TypeError(
                 f"Invalid type for url.  Expected str or httpx.URL, got {type(url)}: {url!r}"
             )
-
-        # Perform port normalization, following the WHATWG spec for default ports.
-        #
-        # See:
-        # * https://tools.ietf.org/html/rfc3986#section-3.2.3
-        # * https://url.spec.whatwg.org/#url-miscellaneous
-        # * https://url.spec.whatwg.org/#scheme-state
-        default_port = {
-            "ftp": ":21",
-            "http": ":80",
-            "https": ":443",
-            "ws": ":80",
-            "wss": ":443",
-        }.get(self._uri_reference.scheme, "")
-        authority = self._uri_reference.authority or ""
-        if default_port and authority.endswith(default_port):
-            authority = authority[: -len(default_port)]
-            self._uri_reference = self._uri_reference.copy_with(authority=authority)
-
-        if kwargs:
-            self._uri_reference = self.copy_with(**kwargs)._uri_reference
 
     @property
     def scheme(self) -> str:
@@ -130,7 +352,7 @@ class URL:
         The URL scheme, such as "http", "https".
         Always normalised to lowercase.
         """
-        return self._uri_reference.scheme or ""
+        return self._parsed.scheme.decode("ascii")
 
     @property
     def raw_scheme(self) -> bytes:
@@ -138,7 +360,7 @@ class URL:
         The raw bytes representation of the URL scheme, such as b"http", b"https".
         Always normalised to lowercase.
         """
-        return self.scheme.encode("ascii")
+        return self._parsed.scheme
 
     @property
     def userinfo(self) -> bytes:
@@ -146,8 +368,7 @@ class URL:
         The URL userinfo as a raw bytestring.
         For example: b"jo%40email.com:a%20secret".
         """
-        userinfo = self._uri_reference.userinfo or ""
-        return userinfo.encode("ascii")
+        return self._parsed.userinfo
 
     @property
     def username(self) -> str:
@@ -155,8 +376,8 @@ class URL:
         The URL username as a string, with URL decoding applied.
         For example: "jo@email.com"
         """
-        userinfo = self._uri_reference.userinfo or ""
-        return unquote(userinfo.partition(":")[0])
+        userinfo: bytes = self._parsed.userinfo
+        return unquote(userinfo.decode("ascii").partition(":")[0])
 
     @property
     def password(self) -> str:
@@ -164,8 +385,8 @@ class URL:
         The URL password as a string, with URL decoding applied.
         For example: "a secret"
         """
-        userinfo = self._uri_reference.userinfo or ""
-        return unquote(userinfo.partition(":")[2])
+        userinfo: bytes = self._parsed.userinfo
+        return unquote(userinfo.decode("ascii").partition(":")[2])
 
     @property
     def host(self) -> str:
@@ -187,16 +408,13 @@ class URL:
         url = httpx.URL("https://[::ffff:192.168.0.1]")
         assert url.host == "::ffff:192.168.0.1"
         """
-        host: str = self._uri_reference.host or ""
+        host: bytes = self._parsed.host
 
-        if host and ":" in host and host[0] == "[":
-            # it's an IPv6 address
-            host = host.lstrip("[").rstrip("]")
-
-        if host.startswith("xn--"):
-            host = idna.decode(host)
-
-        return host
+        if host.startswith(b"xn--"):
+            return idna.decode(host)
+        elif host.startswith(b"[") and host.endswith(b"]"):
+            return host.decode("ascii").lstrip("[").rstrip("]")
+        return host.decode("ascii")
 
     @property
     def raw_host(self) -> bytes:
@@ -218,13 +436,11 @@ class URL:
         url = httpx.URL("https://[::ffff:192.168.0.1]")
         assert url.raw_host == b"::ffff:192.168.0.1"
         """
-        host: str = self._uri_reference.host or ""
+        host: bytes = self._parsed.host
 
-        if host and ":" in host and host[0] == "[":
-            # it's an IPv6 address
-            host = host.lstrip("[").rstrip("]")
-
-        return host.encode("ascii")
+        if host.startswith(b"[") and host.endswith(b"]"):
+            return host.lstrip(b"[").rstrip(b"]")
+        return host
 
     @property
     def port(self) -> typing.Optional[int]:
@@ -240,8 +456,7 @@ class URL:
         assert httpx.URL("http://www.example.com") == httpx.URL("http://www.example.com:80")
         assert httpx.URL("http://www.example.com:80").port is None
         """
-        port = self._uri_reference.port
-        return int(port) if port else None
+        return self._parsed.port
 
     @property
     def netloc(self) -> bytes:
@@ -252,11 +467,14 @@ class URL:
         This property may be used for generating the value of a request
         "Host" header.
         """
-        host = self._uri_reference.host or ""
-        port = self._uri_reference.port
-        netloc = host.encode("ascii")
+        host: bytes = self._parsed.host
+        port: typing.Optional[int] = self._parsed.port
+
+        netloc = host
+        if b":" in netloc:
+            netloc = b"[" + netloc + b"]"
         if port:
-            netloc = netloc + b":" + port.encode("ascii")
+            netloc = netloc + b":" + str(port).encode("ascii")
         return netloc
 
     @property
@@ -269,8 +487,7 @@ class URL:
         url = httpx.URL("https://example.com/pa%20th")
         assert url.path == "/pa th"
         """
-        path = self._uri_reference.path or "/"
-        return unquote(path)
+        return unquote(self._parsed.path) or "/"
 
     @property
     def query(self) -> bytes:
@@ -286,8 +503,7 @@ class URL:
         url = httpx.URL("https://example.com/?filter=some%20search%20terms")
         assert url.query == b"filter=some%20search%20terms"
         """
-        query = self._uri_reference.query or ""
-        return query.encode("ascii")
+        return self._parsed.query or b""
 
     @property
     def params(self) -> "QueryParams":
@@ -295,7 +511,7 @@ class URL:
         The URL query parameters, neatly parsed and packaged into an immutable
         multidict representation.
         """
-        return QueryParams(self._uri_reference.query)
+        return QueryParams(self._parsed.query)
 
     @property
     def raw_path(self) -> bytes:
@@ -309,10 +525,10 @@ class URL:
         Host: www.example.org
         Connection: close
         """
-        path = self._uri_reference.path or "/"
-        if self._uri_reference.query is not None:
-            path += "?" + self._uri_reference.query
-        return path.encode("ascii")
+        raw_path = self._parsed.path or b"/"
+        if self._parsed.query is not None:
+            raw_path += b"?" + self._parsed.query
+        return raw_path
 
     @property
     def fragment(self) -> str:
@@ -320,22 +536,9 @@ class URL:
         The URL fragments, as used in HTML anchors.
         As a string, without the leading '#'.
         """
-        return unquote(self._uri_reference.fragment or "")
+        fragment = self._parsed.fragment or b""
 
-    @property
-    def raw(self) -> RawURL:
-        """
-        The URL in the raw representation used by the low level
-        transport API. See `BaseTransport.handle_request`.
-
-        Provides the (scheme, host, port, target) for the outgoing request.
-        """
-        return (
-            self.raw_scheme,
-            self.raw_host,
-            self.port,
-            self.raw_path,
-        )
+        return unquote(fragment.decode("ascii"))
 
     @property
     def is_absolute_url(self) -> bool:
@@ -347,7 +550,7 @@ class URL:
         # URLs with a fragment portion as not absolute.
         # What we actually care about is if the URL provides
         # a scheme and hostname to which connections should be made.
-        return bool(self._uri_reference.scheme and self._uri_reference.host)
+        return bool(self._parsed.scheme and self._parsed.host)
 
     @property
     def is_relative_url(self) -> bool:
@@ -368,123 +571,29 @@ class URL:
         url = httpx.URL("https://www.example.com").copy_with(username="jo@gmail.com", password="a secret")
         assert url == "https://jo%40email.com:a%20secret@www.example.com"
         """
-        allowed = {
-            "scheme": str,
-            "username": str,
-            "password": str,
-            "userinfo": bytes,
-            "host": str,
-            "port": int,
-            "netloc": bytes,
-            "path": str,
-            "query": bytes,
-            "raw_path": bytes,
-            "fragment": str,
-            "params": object,
+        # Merge the provided keyword arguments with the existing URL.
+        init_kwargs = {
+            "scheme": kwargs.get("scheme", self.scheme),
+            "userinfo": kwargs.get("userinfo", self.userinfo),
+            "host": kwargs.get("host", self.host),
+            "port": kwargs.get("port", self.port),
+            "path": kwargs.get("path", unquote(self._parsed.path)),
+            "query": kwargs.get("query", self.query or None),
+            "fragment": kwargs.get("fragment", self.fragment or None),
         }
 
-        # Step 1
-        # ======
-        #
-        # Perform type checking for all supported keyword arguments.
-        for key, value in kwargs.items():
-            if key not in allowed:
-                message = f"{key!r} is an invalid keyword argument for copy_with()"
-                raise TypeError(message)
-            if value is not None and not isinstance(value, allowed[key]):
-                expected = allowed[key].__name__
-                seen = type(value).__name__
-                message = f"Argument {key!r} must be {expected} but got {seen}"
-                raise TypeError(message)
-
-        # Step 2
-        # ======
-        #
-        # Consolidate "username", "password", "userinfo", "host", "port" and "netloc"
-        # into a single "authority" keyword, for `rfc3986`.
+        # Consolidate any conflicting keyword arguments.
         if "username" in kwargs or "password" in kwargs:
-            # Consolidate "username" and "password" into "userinfo".
-            username = quote(kwargs.pop("username", self.username) or "")
-            password = quote(kwargs.pop("password", self.password) or "")
-            userinfo = f"{username}:{password}" if password else username
-            kwargs["userinfo"] = userinfo.encode("ascii")
+            init_kwargs["username"] = kwargs.get("username", self.username)
+            init_kwargs["password"] = kwargs.get("password", self.password)
+            init_kwargs.pop("userinfo")
 
-        if "host" in kwargs or "port" in kwargs:
-            # Consolidate "host" and "port" into "netloc".
-            host = kwargs.pop("host", self.host) or ""
-            port = kwargs.pop("port", self.port)
+        if "params" in kwargs:
+            init_kwargs["params"] = kwargs["params"]
+            init_kwargs.pop("query")
 
-            if host and ":" in host and host[0] != "[":
-                # IPv6 addresses need to be escaped within square brackets.
-                host = f"[{host}]"
-
-            kwargs["netloc"] = (
-                f"{host}:{port}".encode("ascii")
-                if port is not None
-                else host.encode("ascii")
-            )
-
-        if "userinfo" in kwargs or "netloc" in kwargs:
-            # Consolidate "userinfo" and "netloc" into authority.
-            userinfo = (kwargs.pop("userinfo", self.userinfo) or b"").decode("ascii")
-            netloc = (kwargs.pop("netloc", self.netloc) or b"").decode("ascii")
-            authority = f"{userinfo}@{netloc}" if userinfo else netloc
-            kwargs["authority"] = authority
-
-        # Step 3
-        # ======
-        #
-        # Wrangle any "path", "query", "raw_path" and "params" keywords into
-        # "query" and "path" keywords for `rfc3986`.
-        if "raw_path" in kwargs:
-            # If "raw_path" is included, then split it into "path" and "query" components.
-            raw_path = kwargs.pop("raw_path") or b""
-            path, has_query, query = raw_path.decode("ascii").partition("?")
-            kwargs["path"] = path
-            kwargs["query"] = query if has_query else None
-
-        else:
-            if kwargs.get("path") is not None:
-                # Ensure `kwargs["path"] = <url quoted str>` for `rfc3986`.
-                kwargs["path"] = quote(kwargs["path"])
-
-            if kwargs.get("query") is not None:
-                # Ensure `kwargs["query"] = <str>` for `rfc3986`.
-                #
-                # Note that `.copy_with(query=None)` and `.copy_with(query=b"")`
-                # are subtly different. The `None` style will not include an empty
-                # trailing "?" character.
-                kwargs["query"] = kwargs["query"].decode("ascii")
-
-            if "params" in kwargs:
-                # Replace any "params" keyword with the raw "query" instead.
-                #
-                # Ensure that empty params use `kwargs["query"] = None` rather
-                # than `kwargs["query"] = ""`, so that generated URLs do not
-                # include an empty trailing "?".
-                params = kwargs.pop("params")
-                kwargs["query"] = None if not params else str(QueryParams(params))
-
-        # Step 4
-        # ======
-        #
-        # Ensure any fragment component is quoted.
-        if kwargs.get("fragment") is not None:
-            kwargs["fragment"] = quote(kwargs["fragment"])
-
-        # Step 5
-        # ======
-        #
-        # At this point kwargs may include keys for "scheme", "authority", "path",
-        # "query" and "fragment". Together these constitute the entire URL.
-        #
-        # See https://tools.ietf.org/html/rfc3986#section-3
-        #
-        #  foo://example.com:8042/over/there?name=ferret#nose
-        #  \_/   \______________/\_________/ \_________/ \__/
-        #   |           |            |            |        |
-        # scheme     authority       path        query   fragment
-        return URL(self._uri_reference.copy_with(**kwargs).unsplit())
+        # Build a new URL with the merged components.
+        return URL(**init_kwargs)
 
     def copy_set_param(self, key: str, value: typing.Any = None) -> "URL":
         return self.copy_with(params=self.params.set(key, value))
@@ -508,21 +617,34 @@ class URL:
         url = url.join("/new/path")
         assert url == "https://www.example.com/new/path"
         """
-        if self.is_relative_url:
-            # Workaround to handle relative URLs, which otherwise raise
-            # rfc3986.exceptions.ResolutionError when used as an argument
-            # in `.resolve_with`.
-            return (
-                self.copy_with(scheme="http", host="example.com")
-                .join(url)
-                .copy_with(scheme=None, host=None)
-            )
+        other = URL(url)
+        return URL(urljoin(str(self), str(other)))
 
-        # We drop any fragment portion, because RFC 3986 strictly
-        # treats URLs with a fragment portion as not being absolute URLs.
-        base_uri = self._uri_reference.copy_with(fragment=None)
-        relative_url = URL(url)
-        return URL(relative_url._uri_reference.resolve_with(base_uri).unsplit())
+    def _to_string(self, mask_password: bool = False) -> str:
+        url = ""
+        if self._parsed.scheme:
+            url += self._parsed.scheme.decode("ascii") + ":"
+        if self._parsed.userinfo or self._parsed.host or self._parsed.port:
+            url += "//"
+            if self._parsed.userinfo:
+                if mask_password and self.password:
+                    url += quote(self.username) + ":[secure]@"
+                else:
+                    url += self._parsed.userinfo.decode("ascii") + "@"
+            if self._parsed.host:
+                if b":" in self._parsed.host:
+                    url += "[" + self._parsed.host.decode("ascii") + "]"
+                else:
+                    url += self._parsed.host.decode("ascii")
+            if self._parsed.port:
+                url += ":" + str(self._parsed.port)
+        if self._parsed.path:
+            url += self._parsed.path.decode("ascii")
+        if self._parsed.query is not None:
+            url += "?" + self._parsed.query.decode("ascii")
+        if self._parsed.fragment is not None:
+            url += "#" + self._parsed.fragment.decode("ascii")
+        return url
 
     def __hash__(self) -> int:
         return hash(str(self))
@@ -531,20 +653,11 @@ class URL:
         return isinstance(other, (URL, str)) and str(self) == str(URL(other))
 
     def __str__(self) -> str:
-        return self._uri_reference.unsplit()
+        return self._to_string()
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        url_str = str(self)
-        if self._uri_reference.userinfo:
-            # Mask any password component in the URL representation, to lower the
-            # risk of unintended leakage, such as in debug information and logging.
-            username = quote(self.username)
-            url_str = (
-                rfc3986.urlparse(url_str)
-                .copy_with(userinfo=f"{username}:[secure]")
-                .unsplit()
-            )
+        url_str = self._to_string(mask_password=True)
         return f"{class_name}({url_str!r})"
 
 

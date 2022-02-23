@@ -366,13 +366,3 @@ def test_ipv6_url_copy_with_host(url_str, new_host):
     assert url.host == "::ffff:192.168.0.1"
     assert url.netloc == b"[::ffff:192.168.0.1]:1234"
     assert str(url) == "http://[::ffff:192.168.0.1]:1234"
-
-
-@pytest.mark.parametrize("host", [b"[::ffff:192.168.0.1]", b"::ffff:192.168.0.1"])
-def test_ipv6_url_from_raw_url(host):
-    raw_url = (b"https", host, 443, b"/")
-    url = httpx.URL(raw_url)
-
-    assert url.host == "::ffff:192.168.0.1"
-    assert url.netloc == b"[::ffff:192.168.0.1]"
-    assert str(url) == "https://[::ffff:192.168.0.1]/"
