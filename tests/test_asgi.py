@@ -102,21 +102,21 @@ async def test_asgi():
 @pytest.mark.usefixtures("async_environment")
 async def test_asgi_urlencoded_path():
     async with httpx.AsyncClient(app=echo_path) as client:
-        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        url = httpx.URL("http://www.example.org/").copy_with(path="/path with spaces")
         response = await client.get(url)
 
     assert response.status_code == 200
-    assert response.json() == {"path": "/user@example.org"}
+    assert response.json() == {"path": "/path with spaces"}
 
 
 @pytest.mark.usefixtures("async_environment")
 async def test_asgi_raw_path():
     async with httpx.AsyncClient(app=echo_raw_path) as client:
-        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        url = httpx.URL("http://www.example.org/").copy_with(path="/path with spaces")
         response = await client.get(url)
 
     assert response.status_code == 200
-    assert response.json() == {"raw_path": "/user%40example.org"}
+    assert response.json() == {"raw_path": "/path%20with%20spaces"}
 
 
 @pytest.mark.usefixtures("async_environment")

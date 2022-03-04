@@ -199,9 +199,9 @@ class BaseClient:
         return self._trust_env
 
     def _enforce_trailing_slash(self, url: URL) -> URL:
-        if url.raw_path.endswith(b"/"):
+        if url.path.endswith("/"):
             return url
-        return url.copy_with(raw_path=url.raw_path + b"/")
+        return url.copy_with(path=url.path + "/")
 
     def _get_proxy_map(
         self, proxies: typing.Optional[ProxiesTypes], allow_env_proxies: bool
@@ -381,8 +381,8 @@ class BaseClient:
             # URL('https://www.example.com/subpath/')
             # >>> client.build_request("GET", "/path").url
             # URL('https://www.example.com/subpath/path')
-            merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
-            return self.base_url.copy_with(raw_path=merge_raw_path)
+            merge_path = self.base_url.path + merge_url.path.lstrip("/")
+            return self.base_url.copy_with(path=merge_path)
         return merge_url
 
     def _merge_cookies(

@@ -9,6 +9,7 @@ from ._exceptions import InvalidURL
 from ._types import PrimitiveData, QueryParamTypes, URLTypes
 from ._utils import primitive_value_to_str
 
+MAX_URL_LENGTH = 8000
 NOT_PERCENT_ENCODED = b"!#$&'()*+,-./0123456789:;=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_abcdefghijklmnopqrstuvwxyz~"
 PERCENT_ENCODED_REGEX = re.compile(b"%[A-Fa-f0-9]{2}")
 
@@ -53,26 +54,44 @@ class _ParseResult(typing.NamedTuple):
     scheme: bytes
     userinfo: bytes
     host: bytes
-    port: int
+    port: typing.Optional[int]
     path: bytes
     query: typing.Optional[bytes]
     fragment: typing.Optional[bytes]
 
 
 def parse(url: str, **kwargs: typing.Optional[str]) -> _ParseResult:
-    url = url.replace("\n", "").replace("\r", "").replace("\t", "")
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidURL("URL too long.")
+    if "\n" in url or "\r" in url or "\t" in url:
+        raise InvalidURL("Invalid character in URL.")
 
-    url_match = URL_REGEX.match(url).groupdict()
-    scheme = kwargs.get("scheme", url_match["scheme"]) or ""
-    authority = kwargs.get("authority", url_match["authority"]) or ""
-    path = kwargs.get("path", url_match["path"]) or ""
-    query = kwargs.get("query", url_match["query"])
-    fragment = kwargs.get("fragment", url_match["fragment"])
+    for key, value in kwargs.items():
+        if value is not None:
+            if len(value) > MAX_URL_LENGTH:
+                raise InvalidURL(f"URL component '{key}' too long.")
+            if "\n" in value or "\r" in value or "\t" in value:
+                raise InvalidURL(f"Invalid character in URL component '{key}'.")
 
-    authority_match = AUTHORITY_REGEX.match(authority).groupdict()
-    userinfo = kwargs.get("userinfo", authority_match["userinfo"]) or ""
-    host = kwargs.get("host", authority_match["host"]) or ""
-    port = kwargs.get("port", authority_match["port"])
+    # The URL_REGEX will always match, but may have empty components.
+    url_match = URL_REGEX.match(url)
+    assert url_match is not None
+    url_dict = url_match.groupdict()
+
+    scheme = kwargs.get("scheme", url_dict["scheme"]) or ""
+    authority = kwargs.get("authority", url_dict["authority"]) or ""
+    path = kwargs.get("path", url_dict["path"]) or ""
+    query = kwargs.get("query", url_dict["query"])
+    fragment = kwargs.get("fragment", url_dict["fragment"])
+
+    # The AUTHORITY_REGEX will always match, but may have empty components.
+    authority_match = AUTHORITY_REGEX.match(authority)
+    assert authority_match is not None
+    authority_dict = authority_match.groupdict()
+
+    userinfo = kwargs.get("userinfo", authority_dict["userinfo"]) or ""
+    host = kwargs.get("host", authority_dict["host"]) or ""
+    port = kwargs.get("port", authority_dict["port"])
 
     # Normalize and validate each component.
     # We end up with a parsed representation of the URL,
@@ -80,8 +99,8 @@ def parse(url: str, **kwargs: typing.Optional[str]) -> _ParseResult:
     parsed_scheme: bytes = encode_scheme(scheme)
     parsed_userinfo: bytes = encode_userinfo(userinfo)
     parsed_host: bytes = encode_host(host)
-    parsed_port: int = normalize_port(port, scheme)
-    if scheme and authority:
+    parsed_port: typing.Optional[int] = normalize_port(port, scheme)
+    if scheme and host:
         path = normalize_path(path)
     parsed_path: bytes = encode_path(path)
     parsed_query: typing.Optional[bytes] = encode_query(query)
@@ -123,7 +142,7 @@ def encode_host(host: str) -> bytes:
 
     elif IPv6_STYLE_HOSTNAME.match(host):
         # Validate hostnames like [...]
-        # (IPv6 hostnames must always be enclosed within sqaurte brackets)
+        # (IPv6 hostnames must always be enclosed within square brackets)
         try:
             ipaddress.IPv6Address(host[1:-1])
         except ipaddress.AddressValueError:
@@ -189,7 +208,7 @@ def normalize_port(
 def normalize_path(path: str) -> str:
     # https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4
     components = path.split("/")
-    output = []
+    output: typing.List[str] = []
     for component in components:
         if component == ".":
             pass
@@ -316,6 +335,11 @@ class URL:
                 if "userinfo" in kwargs and kwargs["userinfo"] is not None:
                     kwargs["userinfo"] = kwargs["userinfo"].decode("ascii")
 
+                # The 'port' argument should be coerced to str for the purposes
+                # of our internal parsing.
+                if "port" in kwargs and kwargs["port"] is not None:
+                    kwargs["port"] = str(kwargs["port"])
+
                 # IPv6 hosts need to be enclosed within square brackets.
                 if (
                     kwargs.get("host")
@@ -336,7 +360,9 @@ class URL:
                 # The 'params' keyword argument needs to be coerced to 'query'.
                 if "params" in kwargs:
                     params = kwargs.pop("params")
-                    kwargs["query"] = None if not params else str(QueryParams(params))
+                    kwargs["query"] = (
+                        None if params is None else str(QueryParams(params))
+                    )
 
             self._parsed = parse(url, **kwargs)
         elif isinstance(url, URL):
@@ -487,7 +513,7 @@ class URL:
         url = httpx.URL("https://example.com/pa%20th")
         assert url.path == "/pa th"
         """
-        return unquote(self._parsed.path) or "/"
+        return unquote(self._parsed.path.decode("ascii")) or "/"
 
     @property
     def query(self) -> bytes:
@@ -571,13 +597,37 @@ class URL:
         url = httpx.URL("https://www.example.com").copy_with(username="jo@gmail.com", password="a secret")
         assert url == "https://jo%40email.com:a%20secret@www.example.com"
         """
+        allowed = {
+            "scheme": str,
+            "username": str,
+            "password": str,
+            "userinfo": bytes,
+            "host": str,
+            "port": int,
+            "path": str,
+            "query": bytes,
+            "fragment": str,
+            "params": object,
+        }
+
+        # Perform type checking for all supported keyword arguments.
+        for key, value in kwargs.items():
+            if key not in allowed:
+                message = f"{key!r} is an invalid keyword argument."
+                raise TypeError(message)
+            if value is not None and not isinstance(value, allowed[key]):
+                expected = allowed[key].__name__
+                seen = type(value).__name__
+                message = f"Argument {key!r} must be {expected} but got {seen}."
+                raise TypeError(message)
+
         # Merge the provided keyword arguments with the existing URL.
         init_kwargs = {
             "scheme": kwargs.get("scheme", self.scheme),
             "userinfo": kwargs.get("userinfo", self.userinfo),
             "host": kwargs.get("host", self.host),
             "port": kwargs.get("port", self.port),
-            "path": kwargs.get("path", unquote(self._parsed.path)),
+            "path": kwargs.get("path", unquote(self._parsed.path.decode("ascii"))),
             "query": kwargs.get("query", self.query or None),
             "fragment": kwargs.get("fragment", self.fragment or None),
         }
@@ -602,10 +652,12 @@ class URL:
         return self.copy_with(params=self.params.add(key, value))
 
     def copy_remove_param(self, key: str) -> "URL":
-        return self.copy_with(params=self.params.remove(key))
+        params = self.params.remove(key)
+        return self.copy_with(params=None if not params else params)
 
     def copy_merge_params(self, params: QueryParamTypes) -> "URL":
-        return self.copy_with(params=self.params.merge(params))
+        params = self.params.merge(params)
+        return self.copy_with(params=None if not params else params)
 
     def join(self, url: URLTypes) -> "URL":
         """
