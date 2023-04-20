@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+* Fix optional percent-encoding behaviour. (#2671)
 * More robust checking for opening upload files in binary mode. (#2630)
 * Properly support IP addresses in `NO_PROXY` environment variable. (#2659)
 * Set default file for `NetRCAuth()` to `None` to use the stdlib default. (#2667)
